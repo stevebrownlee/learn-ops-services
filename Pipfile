@@ -9,6 +9,10 @@ sentence-transformers = "*"
 scikit-learn = "*"
 nltk = "*"
 requests = "*"
+pydantic = "*"
+structlog = "*"
+prometheus-client = "*"
+tenacity = "*"
 
 [dev-packages]
 

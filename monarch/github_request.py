@@ -1,28 +1,52 @@
-import os, json, time, requests
+import json, time, requests
+import structlog
+from config import Settings
+
+
+logger = structlog.get_logger()
 
 class GithubRequest(object):
     def __init__(self):
-        self.headers = {
+        self.session = requests.Session()
+        self.settings = Settings()
+
+        self.session.headers.update({
             "Content-Type": "application/json",
             "Accept": "application/vnd.github+json",
             "User-Agent": "nss/ticket-migrator",
             "X-GitHub-Api-Version": "2022-11-28",
-            "Authorization": f'Bearer {os.getenv("GITHUB_PAT")}'
-        }
+            "Authorization": f'Bearer {self.settings.GITHUB_TOKEN}'
+        })
 
     def get(self, url):
-        return self.request_with_retry(lambda: requests.get(url=url, headers=self.headers, timeout=10))
+        logger.info("github_request.get", url=url)
+        return self.request_with_retry(lambda: self.session.get(
+            url=url,
+            headers=self.session.headers,
+            timeout=10)
+        )
 
     def put(self, url, data):
+        logger.info("github_request.put", url=url)
         json_data = json.dumps(data)
-
-        return self.request_with_retry(lambda: requests.put(url=url, data=json_data, headers=self.headers, timeout=10))
+        return self.request_with_retry(lambda: self.session.put(
+            url=url,
+            data=json_data,
+            headers=self.session.headers,
+            timeout=10)
+        )
 
     def post(self, url, data):
+        logger.info("github_request.post", url=url)
         json_data = json.dumps(data)
 
         try:
-            result = self.request_with_retry(lambda: requests.post(url=url, data=json_data, headers=self.headers, timeout=10))
+            result = self.request_with_retry(lambda: self.session.post(
+                url=url,
+                data=json_data,
+                headers=self.session.headers,
+                timeout=10)
+            )
             return result
 
         except TimeoutError:

@@ -1,112 +1,203 @@
-import json, logging, redis, datetime, os
+import os
+from typing import List, Dict
 from time import sleep
+import redis
+import structlog
+from tenacity import retry, stop_after_attempt, wait_exponential
+from prometheus_client import start_http_server
+
+from config import Settings
+from models import IssueTemplate, Issue, MigrationData
 from github_request import GithubRequest
 from slack import SlackAPI
+from metrics import Metrics
 
-# Configure logging
-logging.basicConfig(level=logging.DEBUG)
-logger = logging.getLogger("TicketMigrator")
+# Configure structured logging
+structlog.configure(
+    processors=[
+        structlog.processors.TimeStamper(fmt="iso"),
+        structlog.processors.JSONRenderer()
+    ]
+)
+logger = structlog.get_logger()
 
-github = GithubRequest()
+class TicketMigrator:
+    def __init__(self):
+        self.current_source = None
+        self.settings = Settings()
+        self.github = GithubRequest()
+        self.redis_client = redis.StrictRedis(
+            host=self.settings.REDIS_HOST,
+            port=self.settings.REDIS_PORT,
+            db=self.settings.REDIS_DB
+        )
+        self.metrics = Metrics()
 
-# Initialize the transformer model and Redis connection
-redis_client = redis.StrictRedis(host='localhost', port=6379, db=0)
+    def format_issue(self, template_data: IssueTemplate) -> str:
+        template_file = os.path.join(self.settings.TEMPLATE_DIR, 'issue.md')
+        with open(template_file, 'r') as f:
+            template = f.read()
 
-def format_issue(template_data):
-    __location__ = os.path.realpath(os.path.join(
-        os.getcwd(), os.path.dirname(__file__)))
-    default_template = os.path.join(__location__, 'issue.md')
-    return format_from_template(default_template, template_data)
+        return template.format(**template_data.dict())
 
-def format_from_template(template_filename, template_data):
-    from string import Template
-    template_file = open(template_filename, 'r')
-    template = Template(template_file.read())
-    return template.substitute(template_data)
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=4, max=10)
+    )
+    async def migrate_single_issue(
+        self,
+        target_repo: str,
+        issue: Issue
+    ) -> None:
+        try:
+            url = f'{self.settings.GITHUB_API_URL}/repos/{target_repo}/issues'
+            response = self.github.post(url, issue.model_dump())
 
-def migrate_tickets(data):
-    """ Process the queries and store the results in Redis """
+            if response.status_code != 201:
+                raise Exception(f'Failed to create issue. {response.text}')
 
-    # {
-    #     'source_repo': project.client_template_url,
-    #     'all_target_repositories': issue_target_repos
-    # }
+            self.metrics.issues_migrated.labels(
+                source_repo=self.current_source,
+                target_repo=target_repo
+            ).inc()
 
+            # Update rate limit metric
+            remaining = int(response.headers.get('X-RateLimit-Remaining', 0))
+            self.metrics.github_rate_limit.set(remaining)
 
-    # Get all issues from source repo
-    issues = []
-    page = 1
+            logger.info(
+                "issue.migrated",
+                target_repo=target_repo,
+                issue_title=issue.title
+            )
 
-    github_url = "https://api.github.com"
-    source = data["source_repo"]
-    url = f'{github_url}/repos/{source}/issues?state=open&direction=asc'
+        except Exception as e:
+            self.metrics.migration_errors.labels(
+                source_repo=self.current_source,
+                target_repo=target_repo
+            ).inc()
 
-    while True:
-        res = github.get(f'{url}&page={page}')
-        new_issues = res.json()
-        print(new_issues)
-        if not new_issues:
-            break
-        issues.extend(new_issues)
-        page += 1
+            logger.error(
+                "issue.migration_failed",
+                target_repo=target_repo,
+                issue_title=issue.title,
+                error=str(e)
+            )
+            raise
 
+    async def get_source_issues(self, source_repo: str) -> List[Dict]:
+        issues = []
+        page = 1
 
-    issues_to_migrate = []
-    for issue in issues:
-        new_issue = {}
-        new_issue['title'] = issue['title']
+        while True:
+            url = (f'{self.settings.GITHUB_API_URL}/repos/{source_repo}/issues'
+                  f'?state=open&direction=asc&page={page}')
 
-        template_data = {}
-        template_data['user_name'] = issue['user']['login']
-        template_data['user_url'] = issue['user']['html_url']
-        template_data['user_avatar'] = issue['user']['avatar_url']
-        template_data['date'] = issue['created_at']
-        template_data['url'] = issue['html_url']
-        template_data['body'] = issue['body']
+            response = self.github.get(url)
+            new_issues = response.json()
 
-        new_issue['body'] = format_issue(template_data)
-        issues_to_migrate.append(new_issue)
+            if not new_issues:
+                break
 
+            issues.extend(new_issues)
+            page += 1
 
-    slack = SlackAPI()
-    for target in data['all_target_repositories']:
-        messages = []
-        url = f'{github_url}/repos/{target}/issues'
+            # Update rate limit metric
+            remaining = int(response.headers.get('X-RateLimit-Remaining', 0))
+            self.metrics.github_rate_limit.set(remaining)
 
-        for issue in issues_to_migrate:
-            # Pause for 5 seconds between each ticket to prevent Github throttling
-            sleep(5)
+        return issues
 
-            try:
-                res = github.post(url, issue)
-                result_issue = res.json()
-            except KeyError as err:
-                messages.append(f'Error creating issue {issue["title"]}. {err}.')
+    async def migrate_tickets(self, data: MigrationData) -> None:
+        slack = SlackAPI()
+        self.current_source = data.source_repo
 
+        try:
+            # Get all issues from source repo
+            source_issues = await self.get_source_issues(data.source_repo)
 
-        if messages.count() > 0:
-            slack.send_message(data['notification_channel'], '\n'.join(messages))
-        else:
-            slack.send_message(data['notification_channel'], f'All issues migrated successfully to {target}.')
+            # Format the issues for migration
+            issues_to_migrate = []
+            for issue in source_issues:
+                template_data = IssueTemplate(
+                    user_name=issue['user']['login'],
+                    user_url=issue['user']['html_url'],
+                    user_avatar=issue['user']['avatar_url'],
+                    date=issue['created_at'],
+                    url=issue['html_url'],
+                    body=issue['body']
+                )
 
-        # Pause for 5 minutes between each migration to prevent Github throttling
-        sleep(300)
+                new_issue = Issue(
+                    title=issue['title'],
+                    body=self.format_issue(template_data)
+                )
+                issues_to_migrate.append(new_issue)
 
+            # Migrate issues to each target repo
+            for target in data.all_target_repositories:
+                messages = []
 
+                for issue in issues_to_migrate:
+                    try:
+                        await self.migrate_single_issue(target, issue)
+                    except Exception as e:
+                        messages.append(
+                            f'Error creating issue {issue.title}. {str(e)}.'
+                        )
 
-def main():
-    """ Main function that listens for messages on the Redis channel """
-    pubsub = redis_client.pubsub()
-    pubsub.subscribe('channel_migrate_issue_tickets')
-    logger.info('Waiting for messages. To exit press CTRL+C')
+                    # Pause between issues to prevent rate limiting
+                    sleep(self.settings.GITHUB_RATE_LIMIT_PAUSE)
 
-    for message in pubsub.listen():
-        if message['type'] == 'message':
-            data = json.loads(message['data'])
-            migrate_tickets(data)
+                # Send status message to Slack
+                if messages:
+                    await slack.send_message(
+                        data.notification_channel,
+                        '\n'.join(messages)
+                    )
+                else:
+                    await slack.send_message(
+                        data.notification_channel,
+                        f'All issues migrated successfully to {target}.'
+                    )
+
+                # Pause between repositories
+                # sleep(self.settings.REPO_MIGRATION_PAUSE)
+                sleep(10)
+
+        except Exception as e:
+            logger.error(
+                "migration.failed",
+                source_repo=data.source_repo,
+                error=str(e)
+            )
+            await slack.send_message(
+                data.notification_channel,
+                f'Migration failed: {str(e)}'
+            )
+            raise
+
+    async def run(self):
+        # Start Prometheus metrics server
+        start_http_server(8000)
+
+        pubsub = self.redis_client.pubsub()
+        pubsub.subscribe('channel_migrate_issue_tickets')
+        logger.info('Waiting for messages. To exit press CTRL+C')
+
+        try:
+            for message in pubsub.listen():
+                if message['type'] == 'message':
+                    data = MigrationData.model_validate_json(message['data'])
+                    await self.migrate_tickets(data)
+        except KeyboardInterrupt:
+            logger.info("Shutting down gracefully...")
+        except Exception as e:
+            logger.error("Fatal error", error=str(e))
+            raise
 
 if __name__ == "__main__":
-    main()
+    import asyncio
 
-
-# PUBLISH channel_migrate_issue_tickets '{ "source_repo": "nss-group-projects/rare-all-issues", "all_target_repositories": ["stevebrownlee/rare-test"], "notification_channel": "C06GHMZB3M3"}'
+    migrator = TicketMigrator()
+    asyncio.run(migrator.run())
