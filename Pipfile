@@ -8,6 +8,7 @@ redis = "*"
 sentence-transformers = "*"
 scikit-learn = "*"
 nltk = "*"
+requests = "*"
 
 [dev-packages]
 
