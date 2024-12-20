@@ -116,6 +116,15 @@ class TicketMigrator:
             # Get all issues from source repo
             source_issues = await self.get_source_issues(data.source_repo)
 
+            if not source_issues:
+                logger.info(
+                    "migration.skipped",
+                    source_repo=data.source_repo,
+                    reason="No issues found in source repository"
+                )
+                return
+
+
             # Format the issues for migration
             issues_to_migrate = []
             for issue in source_issues:
